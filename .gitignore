@@ -1,0 +1,18 @@
+.gradle/
+build/
+**/build/
+.idea/
+*.iml
+local.properties
+.externalNativeBuild/
+.cxx/
+
+# Local backup files
+*.bak
+*.before_*
+*.backup
+
+# Build output
+build/
+app/build/
+.gradle/
