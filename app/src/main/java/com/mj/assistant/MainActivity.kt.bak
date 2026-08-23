@@ -1,0 +1,692 @@
+package com.mj.assistant
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import com.mj.assistant.ai.AIEngine
+import com.mj.assistant.ai.LocalAIEngine
+
+private val Bg = Color(0xFF070911)
+private val Surface = Color(0xFF101521)
+private val Surface2 = Color(0xFF151B2A)
+private val Purple = Color(0xFFB86CFF)
+private val Purple2 = Color(0xFF7442C8)
+private val Pink = Color(0xFFFF79C8)
+private val TextMain = Color(0xFFF8F5FC)
+private val TextMuted = Color(0xFF9EA6B8)
+private val Green = Color(0xFF4DE19B)
+
+data class ChatMessage(
+    val id: Long = System.nanoTime(),
+    val text: String,
+    val fromUser: Boolean,
+    val voice: Boolean = false,
+    val dynamic: Boolean = false
+)
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { MJApp() }
+    }
+}
+
+@Composable
+fun MJApp() {
+    var selected by remember { mutableIntStateOf(0) }
+    var listening by remember { mutableStateOf(true) }
+    var verified by remember { mutableStateOf(true) }
+    var text by remember { mutableStateOf("") }
+    var speaking by remember { mutableStateOf(false) }
+    var replying by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val aiEngine: AIEngine = remember { LocalAIEngine() }
+
+    var messages by remember {
+        mutableStateOf(
+            listOf(
+                ChatMessage(
+                    text = "Assalamu Alaikum, main MJ hoon. Aap jo kahenge, main samajhne ki koshish karungi.",
+                    fromUser = false,
+                    voice = true,
+                    dynamic = true
+                )
+            )
+        )
+    }
+
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            background = Bg,
+            surface = Surface,
+            primary = Purple,
+            onBackground = TextMain,
+            onSurface = TextMain
+        )
+    ) {
+        Surface(Modifier.fillMaxSize(), color = Bg) {
+            Column {
+                TopBar(listening, verified, speaking)
+
+                AnimatedContent(
+                    targetState = selected,
+                    transitionSpec = {
+                        (fadeIn(tween(220)) + slideInHorizontally { it / 10 })
+                            .togetherWith(fadeOut(tween(120)))
+                    },
+                    label = "page"
+                ) { page ->
+                    when (page) {
+                        0 -> ChatScreen(
+                            messages = messages,
+                            text = text,
+                            replying = replying,
+                            speaking = speaking,
+                            onTextChange = { text = it },
+                            onSend = {
+                                if (text.isNotBlank() && !replying) {
+                                    val command = text.trim()
+                                    messages = messages + ChatMessage(
+                                        text = command,
+                                        fromUser = true
+                                    )
+                                    text = ""
+                                    replying = true
+                                    scope.launch {
+                                        delay(650)
+                                        val answer = aiEngine.reply(command)
+                                        messages = messages + ChatMessage(
+                                            text = answer,
+                                            fromUser = false,
+                                            voice = true,
+                                            dynamic = true
+                                        )
+                                        replying = false
+                                        speaking = true
+                                        delay(1800)
+                                        speaking = false
+                                    }
+                                }
+                            },
+                            onMic = {
+                                listening = !listening
+                            }
+                        )
+                        1 -> HistoryScreen(messages)
+                        2 -> ActionsScreen()
+                        else -> ProfileScreen()
+                    }
+                }
+
+                NavigationBar(
+                    containerColor = Color(0xFF090C15),
+                    tonalElevation = 0.dp
+                ) {
+                    val labels = listOf("Chat", "History", "Actions", "Profile")
+                    val icons = listOf(
+                        Icons.Outlined.ChatBubbleOutline,
+                        Icons.Outlined.History,
+                        Icons.Outlined.Tune,
+                        Icons.Outlined.PersonOutline
+                    )
+                    labels.forEachIndexed { i, label ->
+                        NavigationBarItem(
+                            selected = selected == i,
+                            onClick = { selected = i },
+                            icon = {
+                                Icon(
+                                    icons[i],
+                                    label,
+                                    modifier = Modifier.size(21.dp)
+                                )
+                            },
+                            label = { Text(label, fontSize = 11.sp) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = Purple,
+                                selectedTextColor = Purple,
+                                indicatorColor = Purple.copy(alpha = .12f),
+                                unselectedIconColor = TextMuted,
+                                unselectedTextColor = TextMuted
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun TopBar(listening: Boolean, verified: Boolean, speaking: Boolean) {
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 13.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text("MJ", fontSize = 25.sp, fontWeight = FontWeight.SemiBold)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(7.dp).clip(CircleShape)
+                        .background(if (listening) Green else TextMuted)
+                )
+                Spacer(Modifier.width(7.dp))
+                Text(
+                    when {
+                        speaking -> "Speaking…"
+                        listening -> "Always listening…"
+                        else -> "Paused"
+                    },
+                    color = TextMuted,
+                    fontSize = 12.sp
+                )
+                if (verified) {
+                    Spacer(Modifier.width(10.dp))
+                    Icon(
+                        Icons.Outlined.VerifiedUser,
+                        null,
+                        tint = Green,
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    Text("Verified", color = Green, fontSize = 12.sp)
+                }
+            }
+        }
+        IconButton(onClick = {}) {
+            Icon(Icons.Outlined.Settings, "Settings", tint = TextMain)
+        }
+    }
+}
+
+@Composable
+fun ChatScreen(
+    messages: List<ChatMessage>,
+    text: String,
+    replying: Boolean,
+    speaking: Boolean,
+    onTextChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onMic: () -> Unit
+) {
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(messages.size, replying) {
+        if (messages.isNotEmpty()) {
+            scope.launch { listState.animateScrollToItem(messages.lastIndex) }
+        }
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        if (messages.size == 1) {
+            MJPresenceCard(listening = true, speaking = speaking)
+        }
+
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 15.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            itemsIndexed(messages, key = { _, m -> m.id }) { _, msg ->
+                ChatBubble(msg)
+            }
+            if (replying) {
+                item(key = "thinking") {
+                    ThinkingBubble()
+                }
+            }
+        }
+
+        Row(
+            Modifier.padding(horizontal = 13.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(
+                onClick = onMic,
+                modifier = Modifier.size(48.dp).clip(CircleShape)
+                    .background(if (speaking) Purple.copy(.2f) else Surface)
+            ) {
+                Icon(
+                    if (speaking) Icons.Outlined.VolumeUp else Icons.Outlined.Mic,
+                    "Voice",
+                    tint = Purple,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+
+            Spacer(Modifier.width(7.dp))
+
+            OutlinedTextField(
+                value = text,
+                onValueChange = onTextChange,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Message MJ…", color = TextMuted) },
+                singleLine = true,
+                shape = RoundedCornerShape(22.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Purple,
+                    unfocusedBorderColor = Color(0xFF252C3B),
+                    focusedContainerColor = Surface,
+                    unfocusedContainerColor = Surface,
+                    cursorColor = Purple
+                )
+            )
+
+            Spacer(Modifier.width(7.dp))
+
+            FloatingActionButton(
+                onClick = onSend,
+                modifier = Modifier.size(49.dp),
+                containerColor = Purple,
+                contentColor = Color.White
+            ) {
+                Icon(Icons.Outlined.Send, "Send")
+            }
+        }
+    }
+}
+
+@Composable
+fun MJPresenceCard(listening: Boolean, speaking: Boolean) {
+    Card(
+        Modifier.fillMaxWidth().padding(horizontal = 15.dp, vertical = 3.dp),
+        shape = RoundedCornerShape(25.dp),
+        colors = CardDefaults.cardColors(containerColor = Surface)
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(vertical = 17.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            DynamicMJOrb(active = listening || speaking, speaking = speaking)
+            Spacer(Modifier.height(12.dp))
+            Text(
+                if (speaking) "MJ is speaking…" else "Listening for you",
+                color = TextMain,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Spacer(Modifier.height(3.dp))
+            Text(
+                "Voice verified • Ready",
+                color = Green,
+                fontSize = 11.sp
+            )
+        }
+    }
+}
+
+@Composable
+fun DynamicMJOrb(active: Boolean, speaking: Boolean) {
+    val infinite = rememberInfiniteTransition(label = "orb")
+    val pulse by infinite.animateFloat(
+        0.92f, 1.08f,
+        animationSpec = infiniteRepeatable(
+            tween(if (speaking) 650 else 1300, easing = FastOutSlowInEasing),
+            RepeatMode.Reverse
+        ),
+        label = "pulse"
+    )
+    val rotation by infinite.animateFloat(
+        0f, 360f,
+        animationSpec = infiniteRepeatable(tween(9000, easing = LinearEasing)),
+        label = "rotation"
+    )
+    val shimmer by infinite.animateFloat(
+        -1f, 1f,
+        animationSpec = infiniteRepeatable(tween(1800, easing = LinearEasing), RepeatMode.Restart),
+        label = "shimmer"
+    )
+
+    Box(Modifier.size(148.dp), contentAlignment = Alignment.Center) {
+        Canvas(Modifier.fillMaxSize()) {
+            val c = center
+            val base = 54.dp.toPx() * if (active) pulse else 1f
+            drawCircle(
+                brush = Brush.radialGradient(
+                    listOf(
+                        Pink.copy(alpha = .22f),
+                        Purple.copy(alpha = .10f),
+                        Color.Transparent
+                    )
+                ),
+                radius = base * 1.75f,
+                center = c
+            )
+            drawCircle(
+                brush = Brush.radialGradient(
+                    listOf(Purple.copy(.9f), Purple2.copy(.65f), Color(0xFF221239))
+                ),
+                radius = base,
+                center = c
+            )
+
+            for (i in 0 until 48) {
+                val a = Math.toRadians((i * 7.5 + rotation).toDouble()).toFloat()
+                val r1 = base + 7.dp.toPx()
+                val r2 = base + 11.dp.toPx() + ((i % 5) * 2).dp.toPx()
+                val x1 = c.x + kotlin.math.cos(a.toDouble()).toFloat() * r1
+                val y1 = c.y + kotlin.math.sin(a.toDouble()).toFloat() * r1
+                val x2 = c.x + kotlin.math.cos(a.toDouble()).toFloat() * r2
+                val y2 = c.y + kotlin.math.sin(a.toDouble()).toFloat() * r2
+                drawLine(
+                    color = Purple.copy(alpha = if (active) .55f else .22f),
+                    start = Offset(x = x1, y = y1),
+                    end = Offset(x = x2, y = y2),
+                    strokeWidth = if (speaking) 3.dp.toPx() else 1.5.dp.toPx(),
+                    cap = StrokeCap.Round
+                )
+            }
+
+            // Claude-like moving translucent "glass/mirror" bands
+            val bandX = size.width * (0.35f + shimmer * .55f)
+            drawOval(
+                brush = Brush.linearGradient(
+                    listOf(Color.Transparent, Color.White.copy(.16f), Color.Transparent)
+                ),
+                topLeft = Offset(x = bandX - 30.dp.toPx(), y = c.y - 42.dp.toPx()),
+                size = Size(width = 60.dp.toPx(), height = 84.dp.toPx())
+            )
+        }
+
+        Box(
+            Modifier.size(92.dp).clip(CircleShape)
+                .background(Color(0xFF1A1028))
+                .border(1.dp, Purple.copy(.55f), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("MJ", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = TextMain)
+        }
+    }
+}
+
+@Composable
+fun ChatBubble(msg: ChatMessage) {
+    val enter by remember {
+        mutableStateOf(true)
+    }
+
+    AnimatedVisibility(
+        visible = enter,
+        enter = fadeIn(tween(240)) + expandVertically(tween(280)),
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = if (msg.fromUser) Arrangement.End else Arrangement.Start
+        ) {
+            Column(
+                Modifier.widthIn(max = 320.dp)
+                    .clip(RoundedCornerShape(
+                        topStart = 18.dp,
+                        topEnd = 18.dp,
+                        bottomStart = if (msg.fromUser) 18.dp else 5.dp,
+                        bottomEnd = if (msg.fromUser) 5.dp else 18.dp
+                    ))
+                    .background(if (msg.fromUser) Purple2 else Surface2)
+                    .padding(13.dp)
+            ) {
+                if (!msg.fromUser) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("MJ", color = Purple, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                        if (msg.dynamic) {
+                            Spacer(Modifier.width(7.dp))
+                            MiniWave()
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                }
+
+                Text(
+                    msg.text,
+                    color = TextMain,
+                    fontSize = 15.sp,
+                    lineHeight = 21.sp
+                )
+
+                if (!msg.fromUser && msg.voice) {
+                    Spacer(Modifier.height(8.dp))
+                    VoiceResponseStrip()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun MiniWave() {
+    val infinite = rememberInfiniteTransition(label = "mini")
+    val x by infinite.animateFloat(
+        -1f, 1f,
+        animationSpec = infiniteRepeatable(tween(1000), RepeatMode.Reverse),
+        label = "miniwave"
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+        repeat(7) { i ->
+            val h = 4 + (kotlin.math.abs(kotlin.math.sin(i * .9 + x)) * 9).toInt()
+            Box(
+                Modifier.width(2.dp).height(h.dp)
+                    .clip(RoundedCornerShape(2.dp))
+                    .background(Purple)
+            )
+        }
+    }
+}
+
+@Composable
+fun VoiceResponseStrip() {
+    val infinite = rememberInfiniteTransition(label = "voice")
+    val shift by infinite.animateFloat(
+        0f, 1f,
+        animationSpec = infiniteRepeatable(tween(1300, easing = LinearEasing)),
+        label = "voiceShift"
+    )
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+            .background(Color(0xFF0C101A)),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        IconButton(onClick = {}) {
+            Icon(Icons.Outlined.PlayArrow, null, tint = Purple)
+        }
+        Canvas(Modifier.weight(1f).height(28.dp).padding(end = 10.dp)) {
+            val mid = size.height / 2
+            for (i in 0 until 50) {
+                val wave = kotlin.math.sin(i * .55 + shift * 6.28f)
+                val h = 3f + kotlin.math.abs(wave) * (7f + (i % 4) * 2f)
+                drawLine(
+                    color = Purple.copy(alpha = .7f),
+                    start = Offset(x = i * size.width / 50f, y = mid - h),
+                    end = Offset(x = i * size.width / 50f, y = mid + h),
+                    strokeWidth = 2f,
+                    cap = StrokeCap.Round
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ThinkingBubble() {
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Start
+    ) {
+        Box(
+            Modifier.clip(RoundedCornerShape(18.dp))
+                .background(Surface2)
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("MJ", color = Purple, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.width(10.dp))
+                repeat(3) { i ->
+                    val infinite = rememberInfiniteTransition(label = "dot$i")
+                    val y by infinite.animateFloat(
+                        0f, -5f,
+                        animationSpec = infiniteRepeatable(
+                            tween(450, delayMillis = i * 120),
+                            RepeatMode.Reverse
+                        ),
+                        label = "dotAnim$i"
+                    )
+                    Box(
+                        Modifier.offset(y = y.dp).size(5.dp)
+                            .clip(CircleShape).background(Purple)
+                    )
+                    if (i < 2) Spacer(Modifier.width(4.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun HistoryScreen(messages: List<ChatMessage>) {
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(18.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        item {
+            Text("History", fontSize = 23.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(8.dp))
+        }
+        items(messages.filter { it.fromUser }) { msg ->
+            ListItem(
+                headlineContent = { Text(msg.text, maxLines = 2) },
+                supportingContent = { Text("Voice / Chat") },
+                leadingContent = { Icon(Icons.Outlined.History, null, tint = Purple) },
+                colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+            )
+        }
+    }
+}
+
+@Composable
+fun ActionsScreen() {
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(18.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        item {
+            Text("Quick Actions", fontSize = 23.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(5.dp))
+        }
+        item {
+            ActionCard("Torch", Icons.Outlined.FlashlightOn, "Device control")
+        }
+        item {
+            ActionCard("Wi‑Fi", Icons.Outlined.Wifi, "Device control")
+        }
+        item {
+            ActionCard("Bluetooth", Icons.Outlined.Bluetooth, "Device control")
+        }
+        item {
+            ActionCard("Battery", Icons.Outlined.BatteryFull, "Device info")
+        }
+        item {
+            ActionCard("Time", Icons.Outlined.Schedule, "Device info")
+        }
+        item {
+            ActionCard("Date", Icons.Outlined.CalendarToday, "Device info")
+        }
+    }
+}
+
+@Composable
+fun ActionCard(name: String, icon: androidx.compose.ui.graphics.vector.ImageVector, sub: String) {
+    Card(
+        Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Surface)
+    ) {
+        Row(
+            Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier.size(45.dp).clip(CircleShape)
+                    .background(Purple.copy(.12f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(icon, null, tint = Purple)
+            }
+            Spacer(Modifier.width(13.dp))
+            Column(Modifier.weight(1f)) {
+                Text(name, fontWeight = FontWeight.Medium)
+                Text(sub, color = TextMuted, fontSize = 12.sp)
+            }
+            Icon(Icons.Outlined.ChevronRight, null, tint = TextMuted)
+        }
+    }
+}
+
+@Composable
+fun ProfileScreen() {
+    LazyColumn(
+        Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        item {
+            Spacer(Modifier.height(20.dp))
+            Box(
+                Modifier.size(105.dp).clip(CircleShape)
+                    .background(Purple2.copy(.35f))
+                    .border(1.dp, Purple.copy(.6f), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("MJ", fontSize = 34.sp, fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.height(14.dp))
+            Text("MJ", fontSize = 25.sp, fontWeight = FontWeight.SemiBold)
+            Text("Voice assistant", color = TextMuted)
+            Spacer(Modifier.height(24.dp))
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Surface)
+            ) {
+                Column(Modifier.padding(18.dp)) {
+                    Text("Voice Verification", fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(7.dp))
+                    Text(
+                        "MJ ka goal authorized user's voice ko verify karke commands accept karna hai.",
+                        color = TextMuted,
+                        fontSize = 13.sp,
+                        lineHeight = 19.sp
+                    )
+                }
+            }
+        }
+    }
+}
