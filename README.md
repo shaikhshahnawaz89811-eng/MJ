@@ -1,54 +1,27 @@
-# MJ Assistant — Full Project
+# MJ Assistant — Qwen3 4B + 1.7B
 
-This is the complete MJ project, including the original project files and the latest UI/interaction fixes.
+Private on-device Android assistant using GGUF models through llama-android.
 
-## Latest UI behavior
-- Chat is text-first; MJ assistant replies do **not** use a visible Claude-style rectangular card.
-- A small purple/pink dynamic MJ orb appears only beside the **current/latest assistant reply**.
-- When a newer MJ reply arrives, the previous reply's orb disappears.
-- The orb is intentionally small and continuously glows/rotates.
-- Each MJ reply has a tiny `MJ` label and a small tappable speaker/listen icon.
-- The top-right voice-output control is small and remains next to Settings.
-- Voice output can be enabled/disabled; typed messages can produce both text and TTS.
-- New assistant text enters from the side and has a short translucent glass/shimmer pass over the text area only.
-- The glass pass stops after the response settles; there is no permanent moving card effect.
-- User messages remain compact purple bubbles.
-- The initial listening orb is smaller and no longer fills the screen.
-- Chat has extra bottom scroll space so the newest message can move above the composer.
-- Sending a message hides the keyboard and triggers the conversation list to reveal the newest item.
-- Composer remains usable when the keyboard is open and supports multiple lines.
-- Bottom navigation is hidden while the IME is open so it cannot be pushed under the keyboard.
-- History, Actions and Profile are scrollable.
-- Torch chat cards are tappable and have a switch for quick ON/OFF control.
+## Models
+- **Qwen3 1.7B Fast** — default everyday model. Uses non-thinking mode for normal chat, facts, short coding and planning; thinking is reserved for genuinely deeper requests.
+- **Qwen2.5 3B** — third, extra-fast slot (`Qwen25ModelEngine`). Import a `qwen2.5-3b-instruct` GGUF (Q4_K_M recommended) from Profile → this model card, same as the other two. Tuned like the 1.7B slot (3072 context, 3–6 threads) for phone/Termux speed. Unlike the Qwen3 slots it never appends "/think" or "/no_think" to the prompt — Qwen2.5-Instruct has no thinking mode and doesn't understand that control syntax.
+- **Qwen3 4B Thinking** — manual deep/reasoning slot.
+- Only one native GGUF model is loaded at a time (enforced by `ModelRuntimeCoordinator`, whichever of the three slots is active).
 
-## Conversation personality
-The basic offline engine uses short, varied Hindi/Hinglish responses and avoids repeating the exact same greeting/fallback on every turn. The personality prompt is prepared for an Indian Muslim female assistant style: respectful, natural, concise, and conversational.
+## Phone-performance design
+- Compact system prompt.
+- Conversation history is injected only for follow-up-like requests.
+- Long-term facts are cached instead of reparsed on every turn.
+- 1.7B uses a 3072-token native context and 3–4 CPU threads.
+- 4B uses a 4096-token native context and 4–6 CPU threads.
+- Generation budgets are bounded but leave enough room for Qwen3 reasoning; every request is fitted to the remaining context window.
+- Expensive retry generation is restricted and bounded.
+- Profile model status shows approximate input/output token counts, speed, mode and retry count.
 
-## Build configuration
-- Android Gradle Plugin: 8.6.1
-- Kotlin: 2.0.21
-- Compose compiler plugin: 2.0.21
-- Compose BOM: 2024.12.01
-- Java/Kotlin JVM target: 17
-- compileSdk: 35
-- targetSdk: 35
-- minSdk: 26
+## Voice
+Voice input is explicit Android Speech Recognizer from the mic button. No wake-word listener is included in this build.
 
-`build-termux.sh` uses the Gradle installation available in Termux. A Gradle wrapper binary is not invented/added because the original project did not contain one.
+## Build
+Use `build-termux.sh` inside a Termux environment with Gradle and native AAPT2 installed.
 
-## Real modules currently present
-- Basic local AI chat engine
-- MJ personality foundation
-- Android Text-to-Speech
-- Torch hardware control with runtime camera permission
-- Chat/history/actions/profile UI
-
-## Not yet integrated
-- Vosk speech-to-text runtime
-- Speaker verification model
-- Qwen `.task` inference runtime
-- Always-on microphone foreground service
-- Wake-word pipeline
-- True interruption/barge-in audio pipeline
-
-Those are kept separate so model/runtime integration does not destabilize the UI.
+See `PERFORMANCE_AUDIT_RECHECK.md`, `QA_RECHECK.md` and `CHANGES_RECHECK.md` for the latest audit.

@@ -3,6 +3,26 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Phase 7 (WifiStatusCommand / Actions tab Wi-Fi card): read-only Wi-Fi
+         state query. Normal-protection permission, no runtime prompt. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Local AI Brain integration (offline, loopback-only client to
+         127.0.0.1:8090). INTERNET is required even for a loopback socket —
+         Android has no separate "localhost only" permission. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Bluetooth: legacy permissions for API <=30, new runtime permission
+         for API 31+ (Android 12 split BLUETOOTH into CONNECT/SCAN). Both are
+         declared so bluetooth_connect/bluetooth_disconnect work across the
+         whole minSdk=26..35 range this app targets. -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- set_brightness: WRITE_SETTINGS is a special "grant via Settings"
+         permission, not a runtime dialog — BrainActionExecutor checks
+         Settings.System.canWrite() and honestly reports when it isn't
+         granted yet, same honesty policy as WifiStatusCommand. -->
+    <uses-permission android:name="android.permission.WRITE_SETTINGS" />
 
     <application
         android:theme="@style/Theme.MJAssistant"
