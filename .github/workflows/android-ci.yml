@@ -21,3 +21,9 @@ jobs:
           java-version: '17' # matches sourceCompatibility in app/build.gradle.kts
       - uses: gradle/actions/setup-gradle@v4
       - run: gradle :app:assembleDebug --stacktrace
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MJ-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
