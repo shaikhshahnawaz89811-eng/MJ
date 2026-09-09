@@ -1,0 +1,23 @@
+name: Android CI
+
+# This repo has no Gradle wrapper (build-termux.sh calls the system gradle
+# directly inside Termux), so gradle/actions/setup-gradle provisions Gradle
+# for the runner instead of the usual ./gradlew. It also does NOT set
+# ORG_GRADLE_PROJECT_android_aapt2FromMavenOverride: that override exists
+# only so build-termux.sh can point at Termux's ARM-native aapt2, because
+# AGP's bundled aapt2 is x86/x86_64 and can't run in Termux's ARM userspace.
+# ubuntu-latest is x86_64, so AGP's own bundled aapt2 already works here —
+# forcing the Termux override on this runner would break the build, not fix it.
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17' # matches sourceCompatibility in app/build.gradle.kts
+      - uses: gradle/actions/setup-gradle@v4
+      - run: gradle :app:assembleDebug --stacktrace

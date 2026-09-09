@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shared by Document Scan -> OCR -> PDF (see MJ_OCR_PDF_SCAN_PLAN.pdf) and the sketch
+     feature (see com.mj.assistant.sketch) — both open their generated PDFs through the
+     same FileProvider declared in AndroidManifest.xml. Exposes only these app-private
+     subfolders; nothing else on the device is reachable through it. -->
+<paths>
+    <!-- Temp full-res photo written by the system camera app (TakePicture()) before OCR
+         reads it back. Deleted by the app right after the scan finishes. -->
+    <cache-path name="scan_captures" path="scan_captures/" />
+    <!-- Final generated scan PDFs (scanned image + cleaned OCR text), opened in an
+         external PDF viewer via ACTION_VIEW. -->
+    <files-path name="scan_pdfs" path="scan_pdfs/" />
+    <!-- Sketch PDFs — only created if the user explicitly asks for one; the inline
+         sketch_images PNGs never need FileProvider since they're drawn directly in
+         chat via Compose's Image(), never opened through an external app/intent. -->
+    <files-path name="sketch_pdfs" path="sketch_pdfs/" />
+</paths>
