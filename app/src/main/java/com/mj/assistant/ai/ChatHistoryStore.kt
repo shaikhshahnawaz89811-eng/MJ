@@ -38,7 +38,12 @@ class ChatHistoryStore(context: Context) {
         val imageUrls: List<String> = emptyList(),
         // Sketch feature (see com.mj.assistant.sketch): absolute path under
         // context.filesDir to the sketch's saved PNG, shown inline in the chat bubble.
-        val sketchImagePath: String? = null
+        val sketchImagePath: String? = null,
+        // Plain "attach as photo" flow (see DocumentScanner.saveAttachedImage): absolute
+        // path under context.filesDir to a photo the USER sent as-is, no OCR/PDF
+        // involved. Set on the user's own message, never the assistant's — mirrors
+        // sketchImagePath's convention but on the other side of the conversation.
+        val userImagePath: String? = null
     )
 
     fun load(): List<PersistedMessage> {
@@ -59,7 +64,8 @@ class ChatHistoryStore(context: Context) {
                             imageUrls = o.optJSONArray("imageUrls")?.let { arr ->
                                 buildList { for (j in 0 until arr.length()) add(arr.optString(j)) }
                             } ?: emptyList(),
-                            sketchImagePath = o.optString("sketchImagePath").ifBlank { null }
+                            sketchImagePath = o.optString("sketchImagePath").ifBlank { null },
+                            userImagePath = o.optString("userImagePath").ifBlank { null }
                         )
                     )
                 }
@@ -82,6 +88,7 @@ class ChatHistoryStore(context: Context) {
                     .put("attachmentPath", m.attachmentPath ?: "")
                     .put("imageUrls", JSONArray(m.imageUrls))
                     .put("sketchImagePath", m.sketchImagePath ?: "")
+                    .put("userImagePath", m.userImagePath ?: "")
             )
         }
         prefs.edit().putString(KEY_MESSAGES, array.toString()).apply()

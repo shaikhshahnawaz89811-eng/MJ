@@ -111,6 +111,14 @@ object DocumentScanner {
             runCatching {
                 File(context.cacheDir, "scan_captures").listFiles()?.forEach { it.delete() }
             }
+            // Plain "attach as photo" images (see saveAttachedImage) age out the same
+            // way scan PDFs do — same retention window, same reasoning.
+            runCatching {
+                File(context.filesDir, "attached_photos")
+                    .listFiles()
+                    ?.filter { it.isFile && it.lastModified() < cutoff }
+                    ?.forEach { it.delete() }
+            }
         }
     }
 
@@ -212,9 +220,45 @@ object DocumentScanner {
     }
 
     /** The cleanup instruction the plan specifies, kept in one place. Caller passes the
-     * result to whichever AIEngine slot is already active — see MainActivity's runScan. */
+     * result to whichever AIEngine slot is already active — see MainActivity's runScan.
+     * Explicitly forbids a "Reply:"/"Here is..." preamble: small on-device models
+     * commonly prefix a cleaned answer with a label like that, which then rendered
+     * verbatim as the first line of MJ's chat bubble (looked like an unattributed raw
+     * dump rather than a reply). stripLeakedPreamble below is a second, defensive line
+     * of cleanup for when the model adds one anyway. */
     fun cleanupPrompt(ocrText: String): String =
-        "Clean up and lightly format this scanned text. Keep it faithful, don't add facts that aren't there:\n\n$ocrText"
+        "Clean up and lightly format this scanned text. Keep it faithful, don't add facts that " +
+            "aren't there. Output ONLY the cleaned text itself — no preamble like \"Reply:\", " +
+            "\"Here is the text:\", or similar:\n\n$ocrText"
+
+    /** Defensive strip for the preamble cleanupPrompt above asks the model not to add —
+     * small models don't reliably follow that instruction. Only strips a recognized
+     * label from the very first line so real scanned content is never touched. */
+    fun stripLeakedPreamble(text: String): String {
+        val firstLineEnd = text.indexOf('\n').let { if (it == -1) text.length else it }
+        val firstLine = text.substring(0, firstLineEnd).trim()
+        val labels = listOf("reply:", "reply", "response:", "here is the cleaned text:", "here's the cleaned text:", "yahan hai:", "cleaned text:")
+        val bare = firstLine.trimEnd(':').lowercase()
+        return if (bare in labels.map { it.trimEnd(':') } && firstLineEnd < text.length) {
+            text.substring(firstLineEnd).trimStart('\n', ' ')
+        } else text
+    }
+
+    /**
+     * Saves a picked/captured image as a plain JPEG under filesDir, for the "attach as
+     * photo" flow (see MainActivity's sendPlainImage) — a user can send MJ a photo
+     * without it going through OCR/PDF at all. Mirrors buildScanPdf's own
+     * Result-wrapped, Dispatchers.IO convention above.
+     */
+    suspend fun saveAttachedImage(context: Context, image: Bitmap): Result<File> =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val outDir = File(context.filesDir, "attached_photos").apply { mkdirs() }
+                val out = File(outDir, "photo_${System.currentTimeMillis()}.jpg")
+                FileOutputStream(out).use { image.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                out
+            }
+        }
 
     /**
      * Builds a PDF: page 1 is the scanned image scaled to fit the page, page(s) 2+ are

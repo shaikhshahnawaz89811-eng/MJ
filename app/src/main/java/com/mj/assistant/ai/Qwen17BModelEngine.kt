@@ -126,6 +126,22 @@ class Qwen17BModelEngine(context: Context) : AIEngine {
                             )
                         }
                         answer = stripRepetitionLoop(cleanThinkingOutput(result.text))
+                        // Bug: the retry's own answer was never re-checked, so a retry
+                        // that came back blank/echoed/off-script just as badly as the
+                        // first attempt still got shown to the user verbatim (this is
+                        // exactly what a 1-2 word command like "karo" produced: the
+                        // correction prompt gives the model nothing new to say, so it
+                        // echoed again and that second echo went straight to chat).
+                        // One retry is already the budget this app spends per message;
+                        // don't spend a third generation, just fall through to the
+                        // honest "couldn't answer" message below instead of trusting
+                        // whatever the retry produced.
+                        val stillBad = answer.isBlank() ||
+                            isGenericDeflection(userInput, answer) ||
+                            isEchoingUser(userInput, answer) ||
+                            (isCodeRequest(userInput) && !looksLikeCode(answer)) ||
+                            isScriptMismatch(userInput, answer)
+                        if (stillBad) answer = ""
                     }
                     val finalAnswer = answer.ifBlank {
                         "Hmm, MJ abhi bhi poora jawab nahi soch paayi ji — chhota/simple sawaal try karo, ya thoda ruk kar dobara poochho."
@@ -536,7 +552,15 @@ class Qwen17BModelEngine(context: Context) : AIEngine {
     private fun isEchoingUser(input: String, answer: String): Boolean {
         val q = input.lowercase(Locale.ROOT).replace(Regex("\\s+"), " ").trim()
         val a = answer.lowercase(Locale.ROOT).replace(Regex("\\s+"), " ").trim()
-        if (q.length < 10 || a.isBlank()) return false
+        if (a.isBlank()) return false
+        // Bug: this used to require q.length >= 10 before checking anything, so a short
+        // command like "karo" got a byte-for-byte echoed "answer" waved through as fine.
+        // An exact match (after normalizing case/whitespace/trailing punctuation) is a
+        // reliable echo signal regardless of length, so check it first, unconditionally.
+        val qBare = q.trimEnd('.', '!', '?', '\u0964')
+        val aBare = a.trimEnd('.', '!', '?', '\u0964')
+        if (qBare.isNotEmpty() && aBare == qBare) return true
+        if (q.length < 10) return false
         val repeated = a.contains("$q $q") || a.contains("$q\n$q")
         val directEcho = q.length >= 16 && a.contains(q) && a.length <= q.length * 2 + 24
         return repeated || directEcho

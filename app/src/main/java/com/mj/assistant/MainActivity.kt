@@ -22,6 +22,8 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
@@ -109,7 +111,12 @@ private data class ChatMessage(
     // PNG under context.filesDir, rendered inline in the chat bubble. Separate from
     // attachmentPath (that stays PDF-only, and is only set later if the user explicitly
     // asks for a PDF of this same sketch — see SketchExportTrigger in onSend).
-    val sketchImagePath: String? = null
+    val sketchImagePath: String? = null,
+    // Plain "attach as photo" flow (see DocumentScanner.saveAttachedImage / Composer's
+    // attach menu): absolute path under context.filesDir to a photo the user sent
+    // as-is. Set on the USER's own message only — never on an assistant reply, same
+    // "own side of the conversation" convention sketchImagePath uses on the other side.
+    val userImagePath: String? = null
 )
 
 private fun ChatMessage.toPersisted() = ChatHistoryStore.PersistedMessage(
@@ -117,7 +124,8 @@ private fun ChatMessage.toPersisted() = ChatHistoryStore.PersistedMessage(
     actionType = action?.type, actionEnabled = action?.enabled ?: false,
     attachmentPath = attachmentPath,
     imageUrls = imageUrls,
-    sketchImagePath = sketchImagePath
+    sketchImagePath = sketchImagePath,
+    userImagePath = userImagePath
 )
 
 private fun ChatHistoryStore.PersistedMessage.toChatMessage() = ChatMessage(
@@ -126,7 +134,8 @@ private fun ChatHistoryStore.PersistedMessage.toChatMessage() = ChatMessage(
     animate = false,
     attachmentPath = attachmentPath,
     imageUrls = imageUrls,
-    sketchImagePath = sketchImagePath
+    sketchImagePath = sketchImagePath,
+    userImagePath = userImagePath
 )
 
 private data class ActionState(val type: String, val enabled: Boolean)
@@ -199,6 +208,18 @@ fun MJApp() {
     var voiceOutput by remember { mutableStateOf(true) }
     var text by remember { mutableStateOf("") }
     var replying by remember { mutableStateOf(false) }
+    // Fix: the "MJ soch rahi hai…" line under the typing indicator used to be a
+    // hardcoded constant (see ThinkingRow) no matter what MJ was actually doing —
+    // scanning a photo, calling web search, or building a sketch all looked
+    // identical to plain thinking. Each branch below that starts real work sets
+    // this to something specific before it begins; it's reset to the generic
+    // default at the start of every new send/scan so a stale label never lingers
+    // into an unrelated task.
+    var thinkingLabel by remember { mutableStateOf("MJ soch rahi hai…") }
+    // Plain "attach as photo" flow (see Composer's attach menu / PendingImagePreview):
+    // holds the picked-but-not-yet-sent photo. Nothing is sent to chat until the
+    // user actually presses ▲ — see onSend's pendingPlainImage branch below.
+    var pendingPlainImage by remember { mutableStateOf<Uri?>(null) }
     var torchOn by remember { mutableStateOf(false) }
     var ttsReady by remember { mutableStateOf(false) }
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -447,6 +468,7 @@ fun MJApp() {
         keyboard?.hide()
         messages = messages + ChatMessage(text = sourceLabel, fromUser = true)
         replying = true
+        thinkingLabel = "Photo padh rahi hai (OCR)…"
         scope.launch {
             try {
                 val bitmap = DocumentScanner.loadBitmap(context, uri).getOrElse {
@@ -471,9 +493,15 @@ fun MJApp() {
                         speak(fail, "mj_scan_no_text")
                         return@launch
                     }
+                    thinkingLabel = "Text saaf kar rahi hai…"
                     // Reuses whichever Qwen slot is already active for chat — no second
                     // model, no cloud LLM key, same as any normal reply.
-                    val cleaned = aiEngine.reply(DocumentScanner.cleanupPrompt(ocrText))
+                    // stripLeakedPreamble: cleanupPrompt already asks the model not to
+                    // preface its answer, but small on-device models don't reliably
+                    // follow that — this was showing up as a bare "Reply" line stuck
+                    // in front of the actual scanned content.
+                    val cleaned = DocumentScanner.stripLeakedPreamble(aiEngine.reply(DocumentScanner.cleanupPrompt(ocrText)))
+                    thinkingLabel = "PDF bana rahi hai…"
                     val attachmentPath = DocumentScanner.buildScanPdf(context, bitmap, cleaned).getOrNull()?.absolutePath
                     messages = messages + ChatMessage(text = cleaned, fromUser = false, attachmentPath = attachmentPath)
                     speak(cleaned, "mj_scan_reply")
@@ -484,9 +512,64 @@ fun MJApp() {
                     // it the moment nothing further below needs it, on every exit path.
                     bitmap.recycle()
                 }
+            } catch (e: Exception) {
+                // Bug: this whole block previously had no catch at all — an unexpected
+                // exception anywhere above (OCR, the AI cleanup call, PDF building)
+                // skipped straight to `finally` with no message ever added to chat.
+                // The thinking indicator would quietly vanish and nothing else would
+                // happen, which looked exactly like MJ had simply ignored the request.
+                val fail = "Scan karte waqt kuch gadbad ho gayi — dobara try karo."
+                messages = messages + ChatMessage(text = fail, fromUser = false)
+                speak(fail, "mj_scan_exception")
             } finally {
                 replying = false
+                thinkingLabel = "MJ soch rahi hai…"
                 ownedTempFile?.delete()
+            }
+        }
+    }
+
+    // Plain "attach as photo" flow (see DocumentScanner.saveAttachedImage /
+    // Composer's attach menu): the counterpart to runScan above, but honest about
+    // what MJ can actually do with an arbitrary photo. There's no vision/image-
+    // understanding model anywhere in this app (OCR via ML Kit is the only real
+    // "reads an image" capability, wired through runScan) — so this never
+    // pretends to describe or analyse the photo's content. It just saves it and
+    // shows it in the chat bubble, same honesty rule as everywhere else here.
+    fun sendPlainImage(uri: Uri, caption: String) {
+        if (replying) return
+        keyboard?.hide()
+        pendingPlainImage = null
+        replying = true
+        thinkingLabel = "Photo save kar rahi hai…"
+        scope.launch {
+            try {
+                val bitmap = DocumentScanner.loadBitmap(context, uri).getOrElse {
+                    messages = messages + ChatMessage(text = "Ye photo attach nahi ho payi — dobara try karo.", fromUser = false)
+                    return@launch
+                }
+                val savedPath = try {
+                    DocumentScanner.saveAttachedImage(context, bitmap).getOrNull()?.absolutePath
+                } finally {
+                    bitmap.recycle()
+                }
+                messages = messages + ChatMessage(
+                    text = caption.trim().ifBlank { "🖼️ Photo" },
+                    fromUser = true,
+                    userImagePath = savedPath
+                )
+                val ack = if (savedPath != null) {
+                    "Photo mil gayi 👍 Isse chat mein save kar diya. Agar isme se text nikalwana hai to \"scan karo\" bol dena — abhi MJ isse sirf save kar sakti hai, dekh/samajh nahi sakti."
+                } else {
+                    "Photo chat mein dikh rahi hai, lekin save karne mein dikkat aa gayi."
+                }
+                messages = messages + ChatMessage(text = ack, fromUser = false)
+                speak(ack, "mj_plain_photo_ack")
+            } catch (e: Exception) {
+                messages = messages + ChatMessage(text = "Kuch gadbad ho gayi photo attach karte waqt — dobara try karo.", fromUser = false)
+            } finally {
+                replying = false
+                thinkingLabel = "MJ soch rahi hai…"
             }
         }
     }
@@ -521,6 +604,15 @@ fun MJApp() {
     val pickImageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) runScan(uri, "🖼️ Gallery se scan bheja")
     }
+    // Fix: previously the ONLY way to send a photo at all was this exact same
+    // launcher wired straight into runScan — any photo, for any reason, was
+    // forced through OCR -> PDF and sent immediately with no preview or choice.
+    // This is the plain-attach counterpart: it only stages the photo (see
+    // pendingPlainImage above / PendingImagePreview in Composer) and waits for
+    // the user to actually press send.
+    val pickPlainImageLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) pendingPlainImage = uri
+    }
 
     MaterialTheme(colorScheme = darkColorScheme(background = Bg, surface = Surface, primary = Purple, onSurface = TextMain)) {
         Surface(Modifier.fillMaxSize(), color = Bg) {
@@ -554,12 +646,23 @@ fun MJApp() {
                                             onTextChange = { text = it },
                                 onCopy = { value -> clipboard.setText(AnnotatedString(value)) },
                                 onSend = {
-                                    if (text.isNotBlank() && !replying) {
+                                    // Fix: this branch used to be the only thing onSend could
+                                    // do. A staged plain-attach photo (see pendingPlainImage /
+                                    // PendingImagePreview) is handled first and separately —
+                                    // whatever's in the text field becomes its caption instead
+                                    // of being parsed as a command.
+                                    val pendingImg = pendingPlainImage
+                                    if (pendingImg != null && !replying) {
+                                        val caption = text
+                                        text = ""
+                                        sendPlainImage(pendingImg, caption)
+                                    } else if (text.isNotBlank() && !replying) {
                                         val command = text.trim()
                                         keyboard?.hide()
                                         messages = messages + ChatMessage(text = command, fromUser = true)
                                         text = ""
                                         replying = true
+                                        thinkingLabel = "MJ soch rahi hai…"
                                         scope.launch {
                                             try {
                                                 // Phase 3 fix: the inline keyword if/else chain now lives in
@@ -598,6 +701,7 @@ fun MJApp() {
                                                     val searchQuery = WebSearch.detectQuery(command)
                                                     val sketchDescription = SketchTrigger.detectDescription(command)
                                                     if (searchQuery != null && searchEnabled && searchHasKey) {
+                                                        thinkingLabel = "Web par search kar rahi hai…"
                                                         when (val result = tavilyClient.search(TavilySearchRequest(query = searchQuery, includeImages = true))) {
                                                             is TavilyCallResult.Success -> {
                                                                 val prompt = WebSearch.buildPrompt(searchQuery, result.response)
@@ -647,6 +751,7 @@ fun MJApp() {
                                                         // showing a blank/broken PDF as if it worked. Shown INLINE
                                                         // only (no PDF yet) — see the SketchExportTrigger branch
                                                         // below for when the user actually asks for one.
+                                                        thinkingLabel = "Sketch bana rahi hai…"
                                                         val rawSketch = aiEngine.reply(SketchJson.prompt(sketchDescription))
                                                         val parsed = SketchJson.parse(rawSketch)
                                                         val spec = parsed.getOrNull()
@@ -671,6 +776,7 @@ fun MJApp() {
                                                         // most recently — this is what actually turns it into a
                                                         // file, per the user's own "sketch pehle, PDF sirf jab
                                                         // maango" instruction.
+                                                        thinkingLabel = "PDF bana rahi hai…"
                                                         val lastSketchPath = messages.last { it.sketchImagePath != null }.sketchImagePath!!
                                                         val bitmap = SketchRenderer.loadPng(lastSketchPath).getOrNull()
                                                         if (bitmap == null) {
@@ -721,8 +827,23 @@ fun MJApp() {
                                                     }
                                                     }
                                                 }
+                                            } catch (e: Exception) {
+                                                // Bug: this try had NO catch at all — any unexpected
+                                                // exception in the block above (a sketch render
+                                                // failure, a search/AI call throwing, anything not
+                                                // already wrapped in its own try/getOrElse) skipped
+                                                // straight to `finally` with no message ever reaching
+                                                // the user. The thinking indicator would just vanish
+                                                // and the conversation would look like MJ silently
+                                                // ignored the message — this is what happened to
+                                                // "car ka sketch banao" in the reported recording.
+                                                messages = messages + ChatMessage(
+                                                    text = "Kuch gadbad ho gayi — dobara try karo.",
+                                                    fromUser = false
+                                                )
                                             } finally {
                                                 replying = false
+                                                thinkingLabel = "MJ soch rahi hai…"
                                             }
                                         }
                                     }
@@ -749,6 +870,11 @@ fun MJApp() {
                                     )
                                 },
                                 onCaptureImage = { startCameraCapture() },
+                                onPickPlainImage = {
+                                    pickPlainImageLauncher.launch(
+                                        androidx.activity.result.PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                                    )
+                                },
                                 onOpenAttachment = { path -> DocumentScanner.openPdf(context, path) },
                                 onOpenImage = { url ->
                                     // url comes from Tavily's response — external, untrusted
@@ -762,11 +888,25 @@ fun MJApp() {
                                     }
                                 },
                                 torchOn = torchOn,
-                                onTorchToggle = {
+                                // Fix: this used to just flip the single live `torchOn` boolean,
+                                // which every Torch card in the whole scrollback silently shared —
+                                // see ChatMessageRow's DeviceActionCard call for the other half of
+                                // this fix. Now it also writes the result onto the SPECIFIC message
+                                // the user tapped, so that card (and only that card) reflects what
+                                // just happened to it.
+                                onTorchToggle = { msgId ->
                                     val target = !torchOn
                                     val ok = requestOrSetTorch(target)
-                                    if (ok) torchOn = target
+                                    if (ok) {
+                                        torchOn = target
+                                        messages = messages.map { m ->
+                                            if (m.id == msgId) m.copy(action = m.action?.copy(enabled = target)) else m
+                                        }
+                                    }
                                 },
+                                thinkingLabel = thinkingLabel,
+                                pendingImageUri = pendingPlainImage,
+                                onCancelPendingImage = { pendingPlainImage = null },
                                 ttsSpeaking = ttsSpeaking,
                                 hasError = activeModelState.error != null
                             )
@@ -796,7 +936,48 @@ fun MJApp() {
                                 onQwen25Unload = { scope.launch { qwen25ModelEngine.unload().onFailure { importError = it.message ?: "2.5B model unload failed" } } },
                                 onQwen25Delete = { scope.launch { qwen25ModelEngine.delete().onFailure { importError = it.message ?: "2.5B model delete failed" } } },
                                 error = importError,
-                                clearError = { importError = null }
+                                clearError = { importError = null },
+                                onClearChat = {
+                                    messages = listOf(welcomeMessage())
+                                    historyStore.clear()
+                                },
+                                onClearMemory = { conversationMemory.clearMemory() },
+                                brainEnabled = brainEnabled,
+                                brainHasKey = brainHasKey,
+                                brainBaseUrl = brainOrchestrator.settingsStore().getBaseUrl(),
+                                onBrainToggle = { target ->
+                                    brainEnabled = target
+                                    brainOrchestrator.settingsStore().setEnabled(target)
+                                },
+                                onBrainSaveKey = { key, url ->
+                                    brainOrchestrator.settingsStore().setBaseUrl(url)
+                                    val saved = brainOrchestrator.settingsStore().saveApiKey(key)
+                                    if (saved) brainHasKey = true
+                                    saved
+                                },
+                                onBrainClearKey = {
+                                    brainOrchestrator.settingsStore().clearApiKey()
+                                    brainHasKey = false
+                                    brainEnabled = false
+                                    brainOrchestrator.settingsStore().setEnabled(false)
+                                },
+                                searchEnabled = searchEnabled,
+                                searchHasKey = searchHasKey,
+                                onSearchToggle = { target ->
+                                    searchEnabled = target
+                                    tavilySecureStore.setEnabled(target)
+                                },
+                                onSearchSaveKey = { key ->
+                                    val saved = tavilySecureStore.saveApiKey(key)
+                                    if (saved) searchHasKey = true
+                                    saved
+                                },
+                                onSearchClearKey = {
+                                    tavilySecureStore.clearApiKey()
+                                    searchHasKey = false
+                                    searchEnabled = false
+                                    tavilySecureStore.setEnabled(false)
+                                }
                             )
                         }
                     }
@@ -881,6 +1062,231 @@ fun MJApp() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared settings cards — used by BOTH SettingsScreen (the gear-icon dialog)
+// and ProfileScreen (the Profile tab). Previously each control (Voice/Data/
+// Brain/Search) only lived inside the Settings dialog, and that dialog had no
+// scroll (see the fixed Dialog below) — so on a normal phone screen, content
+// past roughly the halfway point (the Brain and Web Search cards, including
+// the Tavily search key field) was rendered completely off-screen with no way
+// to reach it. Pulling each section into its own reusable composable does
+// two things: SettingsScreen can now scroll to all of them, and the exact
+// same cards can be placed in ProfileScreen too, so every setting is
+// reachable from both places rather than hidden behind the gear icon alone.
+@Composable
+private fun VoiceSettingCard(voiceOutput: Boolean, onVoiceToggle: () -> Unit) {
+    Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), color = Surface) {
+        Row(Modifier.padding(18.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(42.dp).clip(RoundedCornerShape(12.dp)).background(Purple.copy(.11f)), contentAlignment = Alignment.Center) {
+                Icon(Icons.Outlined.VolumeUp, null, tint = Purple)
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Voice replies")
+                Text(if (voiceOutput) "On — MJ chat ke saath bolegi" else "Off — MJ sirf chat mein reply karegi", color = TextMuted, fontSize = 12.sp)
+            }
+            Switch(checked = voiceOutput, onCheckedChange = { onVoiceToggle() })
+        }
+    }
+}
+
+@Composable
+private fun DataSettingCard(onClearChat: () -> Unit, onClearMemory: () -> Unit) {
+    var clearChatConfirm by remember { mutableStateOf(false) }
+    var clearMemoryConfirm by remember { mutableStateOf(false) }
+    Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), color = Surface) {
+        Column(Modifier.padding(18.dp)) {
+            SettingCardHeader(Icons.Outlined.DeleteOutline, "Data")
+            Spacer(Modifier.height(14.dp))
+            OutlinedButton(onClick = { clearChatConfirm = true }, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Outlined.DeleteOutline, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Clear visible chat")
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = { clearMemoryConfirm = true }, modifier = Modifier.fillMaxWidth()) {
+                Icon(Icons.Outlined.DeleteOutline, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Clear MJ's long-term memory")
+            }
+            Text(
+                "Long-term memory mein remembered facts aur relationships hain — chat history se alag.",
+                color = TextMuted, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.padding(top = 8.dp)
+            )
+        }
+    }
+    if (clearChatConfirm) {
+        AlertDialog(
+            onDismissRequest = { clearChatConfirm = false },
+            title = { Text("Chat clear karein?") },
+            text = { Text("Visible chat history hamesha ke liye delete ho jayegi.") },
+            confirmButton = { TextButton(onClick = { onClearChat(); clearChatConfirm = false }) { Text("Clear") } },
+            dismissButton = { TextButton(onClick = { clearChatConfirm = false }) { Text("Cancel") } }
+        )
+    }
+    if (clearMemoryConfirm) {
+        AlertDialog(
+            onDismissRequest = { clearMemoryConfirm = false },
+            title = { Text("Memory clear karein?") },
+            text = { Text("MJ ke yaad rakhe hue saare facts aur relationships hamesha ke liye delete ho jayenge.") },
+            confirmButton = { TextButton(onClick = { onClearMemory(); clearMemoryConfirm = false }) { Text("Clear") } },
+            dismissButton = { TextButton(onClick = { clearMemoryConfirm = false }) { Text("Cancel") } }
+        )
+    }
+}
+
+@Composable
+private fun BrainSettingCard(
+    brainEnabled: Boolean,
+    brainHasKey: Boolean,
+    brainBaseUrl: String,
+    onBrainToggle: (Boolean) -> Unit,
+    onBrainSaveKey: (String, String) -> Boolean,
+    onBrainClearKey: () -> Unit
+) {
+    Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), color = Surface) {
+        Column(Modifier.padding(18.dp)) {
+            SettingCardHeader(Icons.Outlined.Memory, "Local AI Brain")
+            Spacer(Modifier.height(14.dp))
+            var keyInput by remember { mutableStateOf("") }
+            var urlInput by remember { mutableStateOf(brainBaseUrl) }
+            var saveMsg by remember { mutableStateOf<String?>(null) }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Brain se commands bhejein")
+                    Text(
+                        if (brainEnabled && brainHasKey) "On — configured"
+                        else if (brainHasKey) "Off — key saved"
+                        else "Off — key set nahi hai",
+                        color = TextMuted, fontSize = 12.sp
+                    )
+                }
+                Switch(checked = brainEnabled && brainHasKey, enabled = brainHasKey, onCheckedChange = { onBrainToggle(it) })
+            }
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = urlInput,
+                onValueChange = { urlInput = it },
+                label = { Text("Brain URL") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = keyInput,
+                onValueChange = { keyInput = it; saveMsg = null },
+                label = { Text(if (brainHasKey) "New API key (leave blank to keep current)" else "API key") },
+                singleLine = true,
+                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = {
+                        if (keyInput.isBlank()) {
+                            saveMsg = "Key khaali nahi ho sakti."
+                        } else {
+                            val ok = onBrainSaveKey(keyInput, urlInput)
+                            saveMsg = if (ok) "Saved." else "Save nahi ho saka."
+                            if (ok) keyInput = ""
+                        }
+                    },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Save key") }
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(
+                    onClick = { onBrainClearKey(); saveMsg = "Key removed." },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Remove key") }
+            }
+            saveMsg?.let {
+                Text(it, color = TextMuted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+            }
+            Text(
+                "API key encrypted rehti hai (Android Keystore) aur kabhi bhi logs ya code mein nahi likhi jaati. " +
+                    "Brain sirf $urlInput (local network) se baat karta hai.",
+                color = TextMuted, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.padding(top = 8.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun SearchSettingCard(
+    searchEnabled: Boolean,
+    searchHasKey: Boolean,
+    onSearchToggle: (Boolean) -> Unit,
+    onSearchSaveKey: (String) -> Boolean,
+    onSearchClearKey: () -> Unit
+) {
+    Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp), color = Surface) {
+        Column(Modifier.padding(18.dp)) {
+            SettingCardHeader(Icons.Outlined.Search, "Web Search (Tavily)")
+            Spacer(Modifier.height(14.dp))
+            var searchKeyInput by remember { mutableStateOf("") }
+            var searchSaveMsg by remember { mutableStateOf<String?>(null) }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Message mein \"search karo\" / \"google karo\" bolne par net se dhundo")
+                    Text(
+                        if (searchEnabled && searchHasKey) "On — configured"
+                        else if (searchHasKey) "Off — key saved"
+                        else "Off — key set nahi hai",
+                        color = TextMuted, fontSize = 12.sp
+                    )
+                }
+                Switch(checked = searchEnabled && searchHasKey, enabled = searchHasKey, onCheckedChange = { onSearchToggle(it) })
+            }
+            Spacer(Modifier.height(10.dp))
+            OutlinedTextField(
+                value = searchKeyInput,
+                onValueChange = { searchKeyInput = it; searchSaveMsg = null },
+                label = { Text(if (searchHasKey) "New Tavily API key (leave blank to keep current)" else "Tavily API key (tvly-...)") },
+                singleLine = true,
+                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = {
+                        if (searchKeyInput.isBlank()) {
+                            searchSaveMsg = "Key khaali nahi ho sakti."
+                        } else {
+                            val ok = onSearchSaveKey(searchKeyInput)
+                            searchSaveMsg = if (ok) "Saved." else "Save nahi ho saka."
+                            if (ok) searchKeyInput = ""
+                        }
+                    },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Save key") }
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(
+                    onClick = { onSearchClearKey(); searchSaveMsg = "Key removed." },
+                    modifier = Modifier.weight(1f)
+                ) { Text("Remove key") }
+            }
+            searchSaveMsg?.let {
+                Text(it, color = TextMuted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+            }
+            Text(
+                "Free key: app.tavily.com pe bina card ke sign up karo — 1,000 searches/mahina free. " +
+                    "Ye MJ ka pehla feature hai jo internet use karta hai (baaki sab phone ke andar hi chalta hai); " +
+                    "key encrypted rehti hai, kabhi bhi logs ya code mein nahi likhi jaati.",
+                color = TextMuted, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.padding(top = 8.dp)
+            )
+        }
+    }
+}
+
+@Composable
+private fun SettingCardHeader(icon: androidx.compose.ui.graphics.vector.ImageVector, title: String) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.size(34.dp).clip(RoundedCornerShape(10.dp)).background(Purple.copy(.11f)), contentAlignment = Alignment.Center) {
+            Icon(icon, null, tint = Purple, modifier = Modifier.size(18.dp))
+        }
+        Spacer(Modifier.width(10.dp))
+        Text(title, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+    }
+}
+
 @Composable
 private fun SettingsScreen(
     voiceOutput: Boolean,
@@ -904,180 +1310,42 @@ private fun SettingsScreen(
     // a pure dead button with no screen behind it (audit §11). This also
     // wires up ConversationMemory.clearMemory(), which existed in code but
     // was never called from any UI element.
-    var clearChatConfirm by remember { mutableStateOf(false) }
-    var clearMemoryConfirm by remember { mutableStateOf(false) }
+    //
+    // Fix (this pass): the Column below used to have no .verticalScroll at
+    // all, inside a Dialog that wraps its content height instead of
+    // constraining it. On a normal phone screen the Voice + Data + Local AI
+    // Brain sections alone already ran past the fold, which meant the entire
+    // Web Search card — including the Tavily key field, the one thing this
+    // report specifically asked for — rendered below the visible dialog area
+    // with genuinely no way to scroll down to it. heightIn(max=...) below
+    // bounds the dialog to the screen so verticalScroll has something to
+    // scroll *within*; without a max height a Dialog just grows to fit all
+    // content and the scroll modifier has no effect (confirmed against
+    // Compose's own Dialog-sizing behaviour, not just this app's code).
+    val screenHeight = androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp.dp
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
-        Surface(shape = RoundedCornerShape(22.dp), color = Surface) {
-            Column(Modifier.padding(20.dp).fillMaxWidth()) {
+        Surface(shape = RoundedCornerShape(22.dp), color = Surface, modifier = Modifier.heightIn(max = screenHeight * 0.86f)) {
+            Column(
+                Modifier
+                    .padding(20.dp)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Settings", fontSize = 20.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
                     IconButton(onClick = onDismiss) { Icon(Icons.Outlined.ArrowBack, "Close") }
                 }
-                Spacer(Modifier.height(10.dp))
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Outlined.VolumeUp, null, tint = Purple)
-                    Spacer(Modifier.width(10.dp))
-                    Column(Modifier.weight(1f)) { Text("Voice replies"); Text(if (voiceOutput) "On" else "Off", color = TextMuted, fontSize = 12.sp) }
-                    Switch(checked = voiceOutput, onCheckedChange = { onVoiceToggle() })
-                }
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider(color = Color.White.copy(.06f))
-                Spacer(Modifier.height(16.dp))
-                Text("Data", color = TextMuted, fontSize = 12.sp)
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(onClick = { clearChatConfirm = true }, modifier = Modifier.fillMaxWidth()) {
-                    Icon(Icons.Outlined.DeleteOutline, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Clear visible chat")
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(onClick = { clearMemoryConfirm = true }, modifier = Modifier.fillMaxWidth()) {
-                    Icon(Icons.Outlined.DeleteOutline, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Clear MJ's long-term memory")
-                }
-                Text(
-                    "Long-term memory mein remembered facts aur relationships hain — chat history se alag.",
-                    color = TextMuted, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.padding(top = 6.dp)
-                )
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider(color = Color.White.copy(.06f))
-                Spacer(Modifier.height(16.dp))
-                Text("Local AI Brain", color = TextMuted, fontSize = 12.sp)
-                Spacer(Modifier.height(8.dp))
-                var keyInput by remember { mutableStateOf("") }
-                var urlInput by remember { mutableStateOf(brainBaseUrl) }
-                var saveMsg by remember { mutableStateOf<String?>(null) }
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Brain se commands bhejein")
-                        Text(
-                            if (brainEnabled && brainHasKey) "On — configured"
-                            else if (brainHasKey) "Off — key saved"
-                            else "Off — key set nahi hai",
-                            color = TextMuted, fontSize = 12.sp
-                        )
-                    }
-                    Switch(checked = brainEnabled && brainHasKey, enabled = brainHasKey, onCheckedChange = { onBrainToggle(it) })
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = urlInput,
-                    onValueChange = { urlInput = it },
-                    label = { Text("Brain URL") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = keyInput,
-                    onValueChange = { keyInput = it; saveMsg = null },
-                    label = { Text(if (brainHasKey) "New API key (leave blank to keep current)" else "API key") },
-                    singleLine = true,
-                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                Row(Modifier.fillMaxWidth()) {
-                    OutlinedButton(
-                        onClick = {
-                            if (keyInput.isBlank()) {
-                                saveMsg = "Key khaali nahi ho sakti."
-                            } else {
-                                val ok = onBrainSaveKey(keyInput, urlInput)
-                                saveMsg = if (ok) "Saved." else "Save nahi ho saka."
-                                if (ok) keyInput = ""
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) { Text("Save key") }
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedButton(
-                        onClick = { onBrainClearKey(); saveMsg = "Key removed." },
-                        modifier = Modifier.weight(1f)
-                    ) { Text("Remove key") }
-                }
-                saveMsg?.let {
-                    Text(it, color = TextMuted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
-                }
-                Text(
-                    "API key encrypted rehti hai (Android Keystore) aur kabhi bhi logs ya code mein nahi likhi jaati. " +
-                        "Brain sirf $urlInput (local network) se baat karta hai.",
-                    color = TextMuted, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.padding(top = 6.dp)
-                )
-                Spacer(Modifier.height(16.dp))
-                HorizontalDivider(color = Color.White.copy(.06f))
-                Spacer(Modifier.height(16.dp))
-                Text("Web Search (Tavily)", color = TextMuted, fontSize = 12.sp)
-                Spacer(Modifier.height(8.dp))
-                var searchKeyInput by remember { mutableStateOf("") }
-                var searchSaveMsg by remember { mutableStateOf<String?>(null) }
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Message mein \"search karo\" / \"google karo\" bolne par net se dhundo")
-                        Text(
-                            if (searchEnabled && searchHasKey) "On — configured"
-                            else if (searchHasKey) "Off — key saved"
-                            else "Off — key set nahi hai",
-                            color = TextMuted, fontSize = 12.sp
-                        )
-                    }
-                    Switch(checked = searchEnabled && searchHasKey, enabled = searchHasKey, onCheckedChange = { onSearchToggle(it) })
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = searchKeyInput,
-                    onValueChange = { searchKeyInput = it; searchSaveMsg = null },
-                    label = { Text(if (searchHasKey) "New Tavily API key (leave blank to keep current)" else "Tavily API key (tvly-...)") },
-                    singleLine = true,
-                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                Row(Modifier.fillMaxWidth()) {
-                    OutlinedButton(
-                        onClick = {
-                            if (searchKeyInput.isBlank()) {
-                                searchSaveMsg = "Key khaali nahi ho sakti."
-                            } else {
-                                val ok = onSearchSaveKey(searchKeyInput)
-                                searchSaveMsg = if (ok) "Saved." else "Save nahi ho saka."
-                                if (ok) searchKeyInput = ""
-                            }
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) { Text("Save key") }
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedButton(
-                        onClick = { onSearchClearKey(); searchSaveMsg = "Key removed." },
-                        modifier = Modifier.weight(1f)
-                    ) { Text("Remove key") }
-                }
-                searchSaveMsg?.let {
-                    Text(it, color = TextMuted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
-                }
-                Text(
-                    "Free key: app.tavily.com pe bina card ke sign up karo — 1,000 searches/mahina free. " +
-                        "Ye MJ ka pehla feature hai jo internet use karta hai (baaki sab phone ke andar hi chalta hai); " +
-                        "key encrypted rehti hai, kabhi bhi logs ya code mein nahi likhi jaati.",
-                    color = TextMuted, fontSize = 11.sp, lineHeight = 15.sp, modifier = Modifier.padding(top = 6.dp)
-                )
+                Spacer(Modifier.height(14.dp))
+                VoiceSettingCard(voiceOutput, onVoiceToggle)
+                Spacer(Modifier.height(12.dp))
+                DataSettingCard(onClearChat, onClearMemory)
+                Spacer(Modifier.height(12.dp))
+                BrainSettingCard(brainEnabled, brainHasKey, brainBaseUrl, onBrainToggle, onBrainSaveKey, onBrainClearKey)
+                Spacer(Modifier.height(12.dp))
+                SearchSettingCard(searchEnabled, searchHasKey, onSearchToggle, onSearchSaveKey, onSearchClearKey)
+                Spacer(Modifier.height(4.dp))
             }
         }
-    }
-    if (clearChatConfirm) {
-        AlertDialog(
-            onDismissRequest = { clearChatConfirm = false },
-            title = { Text("Chat clear karein?") },
-            text = { Text("Visible chat history hamesha ke liye delete ho jayegi.") },
-            confirmButton = { TextButton(onClick = { onClearChat(); clearChatConfirm = false }) { Text("Clear") } },
-            dismissButton = { TextButton(onClick = { clearChatConfirm = false }) { Text("Cancel") } }
-        )
-    }
-    if (clearMemoryConfirm) {
-        AlertDialog(
-            onDismissRequest = { clearMemoryConfirm = false },
-            title = { Text("Memory clear karein?") },
-            text = { Text("MJ ke yaad rakhe hue saare facts aur relationships hamesha ke liye delete ho jayenge.") },
-            confirmButton = { TextButton(onClick = { onClearMemory(); clearMemoryConfirm = false }) { Text("Clear") } },
-            dismissButton = { TextButton(onClick = { clearMemoryConfirm = false }) { Text("Cancel") } }
-        )
     }
 }
 
@@ -1131,10 +1399,14 @@ private fun ChatScreen(
     onSpeak: (String) -> Unit,
     onPickImage: () -> Unit,
     onCaptureImage: () -> Unit,
+    onPickPlainImage: () -> Unit,
     onOpenAttachment: (String) -> Unit,
     onOpenImage: (String) -> Unit,
     torchOn: Boolean,
-    onTorchToggle: () -> Unit,
+    onTorchToggle: (Long) -> Unit,
+    thinkingLabel: String = "MJ soch rahi hai…",
+    pendingImageUri: Uri? = null,
+    onCancelPendingImage: () -> Unit = {},
     ttsSpeaking: Boolean = false,
     hasError: Boolean = false
 ) {
@@ -1172,7 +1444,11 @@ private fun ChatScreen(
                     }
                 )
             }
-            if (replying) item(key = "thinking") { ThinkingRow() }
+            if (replying) item(key = "thinking") { ThinkingRow(thinkingLabel) }
+        }
+
+        if (pendingImageUri != null) {
+            PendingImagePreview(pendingImageUri, onCancelPendingImage)
         }
 
         Composer(
@@ -1182,6 +1458,8 @@ private fun ChatScreen(
             onSend = onSend,
             onPickImage = onPickImage,
             onCaptureImage = onCaptureImage,
+            onPickPlainImage = onPickPlainImage,
+            hasPendingImage = pendingImageUri != null,
             enabled = !replying && modelState.status !in setOf(QwenModelEngine.ModelState.Status.IMPORTING, QwenModelEngine.ModelState.Status.LOADING, QwenModelEngine.ModelState.Status.UNLOADING, QwenModelEngine.ModelState.Status.DELETING)
         )
     }
@@ -1270,7 +1548,7 @@ private fun ChatMessageRow(
     msg: ChatMessage,
     isLatestAssistant: Boolean,
     torchOn: Boolean,
-    onTorchToggle: () -> Unit,
+    onTorchToggle: (Long) -> Unit,
     onCopy: (String) -> Unit,
     onSpeak: (String) -> Unit,
     onOpenAttachment: (String) -> Unit,
@@ -1285,7 +1563,7 @@ private fun ChatMessageRow(
     ) {
         if (msg.fromUser) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                UserMessage(msg.text)
+                UserMessage(msg.text, msg.userImagePath)
             }
         } else {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
@@ -1302,9 +1580,22 @@ private fun ChatMessageRow(
                     // be wired to the torch callback; doing that would make a
                     // non-torch response look like an ON/OFF switch and could
                     // toggle the camera torch when the user taps it.
+                    //
+                    // Bug: this used to always show the live `torchOn` value here,
+                    // so every Torch card in the whole scrollback — not just this
+                    // message's — instantly followed whatever the CURRENT torch
+                    // state was. That's how a card could sit right under "Ji, torch
+                    // on kar di." and still show OFF: `torchOn` reset to its default
+                    // false on the app's last cold start (nothing restores it from
+                    // real hardware state) while this message's own recorded result
+                    // said ON. Showing msg.action.enabled makes the card always match
+                    // what MJ actually said for THIS message; tapping it still drives
+                    // the real torch AND updates this specific message's own state
+                    // (see onTorchToggle in MJApp), instead of a shared live variable
+                    // every card secretly pointed at.
                     if (msg.action?.type == "Torch") {
                         Spacer(Modifier.height(8.dp))
-                        DeviceActionCard("Torch", torchOn, onTorchToggle)
+                        DeviceActionCard("Torch", msg.action.enabled) { onTorchToggle(msg.id) }
                     }
                     // Document Scan -> OCR -> PDF (see MJ_OCR_PDF_SCAN_PLAN.pdf): the
                     // generated PDF, opened via a FileProvider content:// URI.
@@ -1348,17 +1639,40 @@ private fun ChatMessageRow(
 }
 
 @Composable
-private fun UserMessage(text: String) {
-    Text(
-        text = text,
-        color = TextMain,
-        fontSize = 15.sp,
-        lineHeight = 21.sp,
+private fun UserMessage(text: String, imagePath: String? = null) {
+    Column(
         modifier = Modifier
             .widthIn(max = 300.dp)
             .background(Purple2.copy(.82f), RoundedCornerShape(18.dp, 18.dp, 5.dp, 18.dp))
-            .padding(horizontal = 14.dp, vertical = 10.dp)
-    )
+            .padding(6.dp)
+    ) {
+        // Plain "attach as photo" flow (see DocumentScanner.saveAttachedImage): a photo
+        // the user sent as-is, no OCR/PDF — shown directly via Compose's Image() the
+        // same way sketchImagePath already renders on the assistant's side.
+        imagePath?.let { path ->
+            val bitmap = remember(path) {
+                runCatching { android.graphics.BitmapFactory.decodeFile(path)?.asImageBitmap() }.getOrNull()
+            }
+            bitmap?.let {
+                Image(
+                    bitmap = it,
+                    contentDescription = "Attached photo",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(13.dp)),
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                )
+                Spacer(Modifier.height(6.dp))
+            }
+        }
+        Text(
+            text = text,
+            color = TextMain,
+            fontSize = 15.sp,
+            lineHeight = 21.sp,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+        )
+    }
 }
 
 @Composable
@@ -1527,7 +1841,7 @@ private fun ModelChatBanner(state: ChatModelState) {
 }
 
 @Composable
-private fun ThinkingRow() {
+private fun ThinkingRow(label: String = "MJ soch rahi hai…") {
     val transition = rememberInfiniteTransition(label = "thinkingGlass")
     val phase by transition.animateFloat(
         -1f, 1f,
@@ -1598,7 +1912,46 @@ private fun ThinkingRow() {
                     if (i < 2) Spacer(Modifier.width(3.dp))
                 }
                 Spacer(Modifier.width(6.dp))
-                Text("MJ soch rahi hai…", color = TextMuted, fontSize = 12.sp)
+                Text(label, color = TextMuted, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PendingImagePreview(uri: Uri, onCancel: () -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    // Small local preview only (not the full downsampled decode DocumentScanner does
+    // for OCR/PDF) — this is just so the user can see WHAT they're about to send
+    // before confirming, same reasoning as any chat app's attachment preview strip.
+    val bitmap = remember(uri) {
+        runCatching {
+            context.contentResolver.openInputStream(uri)?.use { android.graphics.BitmapFactory.decodeStream(it) }?.asImageBitmap()
+        }.getOrNull()
+    }
+    Surface(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+        shape = RoundedCornerShape(14.dp),
+        color = Surface
+    ) {
+        Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier.size(46.dp).clip(RoundedCornerShape(10.dp)).background(Surface3),
+                contentAlignment = Alignment.Center
+            ) {
+                if (bitmap != null) {
+                    Image(bitmap = bitmap, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = androidx.compose.ui.layout.ContentScale.Crop)
+                } else {
+                    Icon(Icons.Outlined.Image, null, tint = TextMuted, modifier = Modifier.size(20.dp))
+                }
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Photo bhejne ke liye taiyar", color = TextMain, fontSize = 13.sp)
+                Text("Neeche caption likho (optional) aur ▲ dabao", color = TextMuted, fontSize = 11.sp)
+            }
+            IconButton(onClick = onCancel, modifier = Modifier.size(32.dp)) {
+                Icon(Icons.Outlined.Close, contentDescription = "Cancel photo", tint = TextMuted, modifier = Modifier.size(18.dp))
             }
         }
     }
@@ -1612,29 +1965,47 @@ private fun Composer(
     onSend: () -> Unit,
     onPickImage: () -> Unit,
     onCaptureImage: () -> Unit,
+    onPickPlainImage: () -> Unit,
+    hasPendingImage: Boolean,
     enabled: Boolean
 ) {
     // Document Scan -> OCR -> PDF (see MJ_OCR_PDF_SCAN_PLAN.pdf): the plan's single
-    // "Attach" icon opens a 2-way choice (camera vs gallery) since the pipeline has two
-    // separate launchers to reach.
+    // "Attach" icon opens a choice of launchers to reach.
+    //
+    // Fix: this used to be a 2-way choice (camera scan / gallery scan) where BOTH
+    // options ran straight into the OCR -> PDF pipeline the instant a photo was
+    // picked, with no way to just send a photo and no preview/confirm step first —
+    // any photo, for any reason, became a "scan" whether that's what it was or not.
+    // "Gallery se photo bhejo" below is the plain path: it only stages the photo
+    // (see PendingImagePreview above), and nothing is sent until the user actually
+    // presses ▲.
     var showAttachMenu by remember { mutableStateOf(false) }
     Row(
         Modifier.fillMaxWidth().imePadding().padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.Bottom
     ) {
         Box {
-            IconButton(onClick = { showAttachMenu = true }, enabled = enabled, modifier = Modifier.size(46.dp).clip(CircleShape).background(Surface)) {
-                Icon(Icons.Outlined.AttachFile, contentDescription = "Document scan karo", modifier = Modifier.size(20.dp), tint = Purple)
+            IconButton(
+                onClick = { showAttachMenu = true },
+                enabled = enabled,
+                modifier = Modifier.size(46.dp).clip(CircleShape).background(if (hasPendingImage) Purple.copy(.22f) else Surface)
+            ) {
+                Icon(Icons.Outlined.AttachFile, contentDescription = "Attach", modifier = Modifier.size(20.dp), tint = Purple)
             }
             DropdownMenu(expanded = showAttachMenu, onDismissRequest = { showAttachMenu = false }) {
                 DropdownMenuItem(
-                    text = { Text("Camera se scan karo") },
+                    text = { Text("Gallery se photo bhejo") },
+                    leadingIcon = { Icon(Icons.Outlined.Image, contentDescription = null) },
+                    onClick = { showAttachMenu = false; onPickPlainImage() }
+                )
+                DropdownMenuItem(
+                    text = { Text("Camera se scan karo (text nikaalo)") },
                     leadingIcon = { Icon(Icons.Outlined.PhotoCamera, contentDescription = null) },
                     onClick = { showAttachMenu = false; onCaptureImage() }
                 )
                 DropdownMenuItem(
-                    text = { Text("Gallery se chuno") },
-                    leadingIcon = { Icon(Icons.Outlined.Image, contentDescription = null) },
+                    text = { Text("Gallery se scan karo (text nikaalo)") },
+                    leadingIcon = { Icon(Icons.Outlined.PictureAsPdf, contentDescription = null) },
                     onClick = { showAttachMenu = false; onPickImage() }
                 )
             }
@@ -1649,7 +2020,7 @@ private fun Composer(
             onValueChange = onTextChange,
             enabled = enabled,
             modifier = Modifier.weight(1f),
-            placeholder = { Text("Message MJ…", color = TextMuted) },
+            placeholder = { Text(if (hasPendingImage) "Caption likho (optional)…" else "Message MJ…", color = TextMuted) },
             minLines = 1,
             maxLines = 4,
             shape = RoundedCornerShape(22.dp),
@@ -1764,7 +2135,25 @@ private fun ProfileScreen(
     onQwen25Unload: () -> Unit,
     onQwen25Delete: () -> Unit,
     error: String?,
-    clearError: () -> Unit
+    clearError: () -> Unit,
+    // Fix: these settings previously only lived behind the gear-icon dialog
+    // (SettingsScreen) — the report specifically asked for the same options
+    // to also be reachable from the Profile tab. Same callbacks MJApp already
+    // threads to SettingsScreen, same shared card composables, just a second
+    // place to reach them from.
+    onClearChat: () -> Unit,
+    onClearMemory: () -> Unit,
+    brainEnabled: Boolean,
+    brainHasKey: Boolean,
+    brainBaseUrl: String,
+    onBrainToggle: (Boolean) -> Unit,
+    onBrainSaveKey: (String, String) -> Boolean,
+    onBrainClearKey: () -> Unit,
+    searchEnabled: Boolean,
+    searchHasKey: Boolean,
+    onSearchToggle: (Boolean) -> Unit,
+    onSearchSaveKey: (String) -> Boolean,
+    onSearchClearKey: () -> Unit
 ) {
     LazyColumn(Modifier.fillMaxSize().imePadding(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
@@ -1824,6 +2213,12 @@ private fun ProfileScreen(
                 onDelete = onQwen25Delete
             )
         }
+        item {
+            Text("App settings", color = TextMuted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+        }
+        item { DataSettingCard(onClearChat, onClearMemory) }
+        item { BrainSettingCard(brainEnabled, brainHasKey, brainBaseUrl, onBrainToggle, onBrainSaveKey, onBrainClearKey) }
+        item { SearchSettingCard(searchEnabled, searchHasKey, onSearchToggle, onSearchSaveKey, onSearchClearKey) }
         if (error != null) {
             item {
                 Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(17.dp), color = Color(0xFF2A151A)) {
